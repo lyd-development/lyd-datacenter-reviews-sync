@@ -13,9 +13,14 @@ from .maps_api import parse_batch_execute_body
 
 
 async def dismiss_consent_dialog(page: Page) -> None:
+    # A real consent dialog renders near-instantly on page load if it's
+    # going to show at all — no reason to wait seconds for one. Short
+    # timeout here so the common case (no dialog at all, e.g. on Apify's
+    # context) doesn't burn up to 6s per call (called twice per
+    # open_location) waiting for buttons that were never coming.
     for pattern in (r"reject all", r"accept all"):
         try:
-            await page.get_by_role("button", name=re.compile(pattern, re.I)).click(timeout=3000)
+            await page.get_by_role("button", name=re.compile(pattern, re.I)).click(timeout=800)
             return
         except Exception:
             continue
@@ -85,7 +90,14 @@ async def extract_location_info(page: Page, place_id: str) -> dict:
     }
 
 
-async def open_reviews_tab(page: Page, place_id: str, max_attempts: int = 4) -> None:
+async def open_reviews_tab(page: Page, place_id: str, max_attempts: int = 2) -> None:
+    # Reduced from 4 (2026-08-19) — a venue whose Reviews tab genuinely
+    # never loads was burning up to ~158s of billable compute across 4 full
+    # attempts before finally giving up. A structural failure here doesn't
+    # get more likely to succeed on attempt #4 than #2, and the cron already
+    # retries a failed location on its next scheduled tick regardless — so
+    # fewer attempts means cheaper failures without giving up on the venue
+    # entirely.
     reviews_tab = page.locator('button[aria-label^="Reviews for"]').or_(
         page.get_by_role("tab", name=re.compile("reviews", re.I))
     )
@@ -121,7 +133,7 @@ SORT_TRIGGER_NAME_PATTERN = re.compile(
 )
 
 
-async def sort_by_newest(page: Page, max_attempts: int = 5) -> dict | None:
+async def sort_by_newest(page: Page, max_attempts: int = 3) -> dict | None:
     """Returns the raw request (URL/headers/postData) that produced the
     confirmed newest-sorted response — the caller (main.py) needs this
     specific request as the RPC-pagination template, NOT whatever request the
@@ -130,6 +142,12 @@ async def sort_by_newest(page: Page, max_attempts: int = 5) -> dict | None:
     ran — using it for pagination silently ignores the sort entirely, which
     is exactly what caused a real run's RPC-paged output to come back
     unsorted)."""
+    # max_attempts reduced from 5 (2026-08-19) — cuts the worst-case cost of
+    # a fully-broken run roughly in half, without touching any of the
+    # per-attempt timeouts (8s/12s/4s) that protect a legitimately-slow-but-
+    # real response — only how many times a structurally-broken attempt
+    # gets retried before giving up for this run. The cron already retries
+    # a failed location on its next scheduled tick regardless.
     # Confirmed on a real run against a large venue (22568 reviews): a
     # loading overlay (class "mYFZJb") still intercepted pointer events on
     # the Sort button after only 1500ms, causing every click to fail for

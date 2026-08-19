@@ -91,6 +91,7 @@ def to_dataset_record(review: dict) -> dict:
         "reviewImgUrl": review["review_img_url"],
         "reviewImgUrls": json_module.dumps(review["review_img_urls"]) if review["review_img_urls"] else None,
         "authorLink": review["author_link"],
+        "authorImage": review["author_image"],
         "subRatings": json_module.dumps(review["sub_ratings"]) if review["sub_ratings"] else None,
         "reviewAttributes": json_module.dumps(review["review_attributes"]) if review["review_attributes"] else None,
     }
