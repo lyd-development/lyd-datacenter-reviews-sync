@@ -7,6 +7,7 @@ from __future__ import annotations
 import re
 from urllib.parse import quote
 
+from apify import Actor
 from playwright.async_api import Page
 
 from .maps_api import parse_batch_execute_body
@@ -233,7 +234,33 @@ async def sort_by_newest(page: Page, max_attempts: int = 3) -> dict | None:
             # function runs, not a longer pause here).
             await page.wait_for_timeout(1500)
             return captured_request
-        except Exception:
+        except Exception as exc:
+            # Diagnostic capture — this exact interaction fails reliably on
+            # some venues in Apify's container while being unreproducible
+            # locally (confirmed live, 2026-08-20: La Brisa Bali and Bokashi
+            # Berawa both fail here repeatedly on Apify, both succeed
+            # instantly in a local Windows/Chrome test). Best-effort only —
+            # a capture failure must never mask the real error below.
+            try:
+                await page.screenshot(path="/tmp/sort_click_failure.png")
+                await Actor.set_value(
+                    "SORT_CLICK_FAILURE_SCREENSHOT",
+                    open("/tmp/sort_click_failure.png", "rb").read(),
+                    content_type="image/png",
+                )
+                menu_html = await page.evaluate(
+                    """() => {
+                        const items = Array.from(document.querySelectorAll('[role="menuitemradio"]'));
+                        return items.map((el) => el.outerHTML).join("\\n---\\n") || "(no menuitemradio elements found)";
+                    }"""
+                )
+                await Actor.set_value(
+                    "SORT_CLICK_FAILURE_STATE",
+                    {"attempt": attempt, "error": str(exc), "menu_html": menu_html},
+                )
+            except Exception as capture_exc:
+                Actor.log.warning(f"Diagnostic capture itself failed: {capture_exc}")
+
             if attempt == max_attempts:
                 raise
             await page.wait_for_timeout(2000)
