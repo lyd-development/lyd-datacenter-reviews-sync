@@ -1,3 +1,11 @@
+# --- Apify local run storage (created by `apify run` locally — datasets/
+# key-value store contents, not source) ---
+apify_storage/
+
+# --- Ad-hoc diagnostic scripts left at the repo root during debugging ---
+diag_*.py
+check_*.py
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[codz]

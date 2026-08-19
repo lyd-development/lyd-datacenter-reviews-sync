@@ -1,0 +1,31 @@
+{
+    "$schema": "https://apify.com/schemas/v1/input.ide.json",
+    "title": "Reviews — Google Review Instance Input",
+    "type": "object",
+    "schemaVersion": 1,
+    "properties": {
+        "placeId": {
+            "title": "Google place_id",
+            "type": "string",
+            "description": "The Google Maps place_id of the venue to scrape (e.g. ChIJ84FTuLhG0i0R1rMrarZInMo).",
+            "editor": "textfield"
+        },
+        "maxReviews": {
+            "title": "Max reviews (0 = unlimited)",
+            "type": "integer",
+            "description": "Stop after collecting this many new reviews. Leave at 0 for a full backfill.",
+            "default": 0,
+            "editor": "number"
+        },
+        "sortBy": {
+            "title": "Sort order",
+            "type": "string",
+            "description": "\"newest\" sorts the review feed before scrolling. \"relevant\" leaves Google's default order and skips the sort step.",
+            "editor": "select",
+            "enum": ["newest", "relevant"],
+            "enumTitles": ["Newest", "Most relevant (default order, skip sorting)"],
+            "default": "newest"
+        }
+    },
+    "required": ["placeId"]
+}

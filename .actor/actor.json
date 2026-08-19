@@ -1,0 +1,20 @@
+{
+    "$schema": "https://apify.com/schemas/v1/actor.ide.json",
+    "actorSpecification": 1,
+    "name": "reviews-maps-google-review-instance",
+    "title": "Reviews — Google Maps Fast Backfill",
+    "description": "Scrapes Google Maps reviews for a given place_id (Playwright-based), sorted newest-first, with full field parity (author info, ratings, text, translations, sub-ratings, owner replies). Triggered by the Reviews dashboard API via webhook for automated backfill and steady-state refresh.",
+    "version": "1.0",
+    "buildTag": "latest",
+    "meta": {
+        "templateId": "python-playwright",
+        "generatedBy": "Ardika"
+    },
+    "inputSchema": "./input_schema.json",
+    "dockerfile": "../Dockerfile",
+    "defaultRunOptions": {
+        "build": "latest",
+        "memoryMbytes": 4096,
+        "timeoutSecs": 86400
+    }
+}

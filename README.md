@@ -1,1 +1,1 @@
-# lyd-datacenter-reviews-sync
+# google-review-instance
