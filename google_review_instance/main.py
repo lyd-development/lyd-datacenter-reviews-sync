@@ -52,6 +52,15 @@ from .scroll_reviews import _sort_newest_first, create_review_collector, scroll_
 # different number without new evidence.
 RPC_PAGE_SIZE = None
 
+# How many fresh-browser-context attempts to give the setup phase (open
+# location -> open Reviews tab -> sort Newest) before giving up. Kept small —
+# 2, not more — since the one proven-working condition is "first attempt on
+# a brand-new session," so a 2nd attempt (fresh context) either fixes it or
+# it won't; further attempts just burn compute on the same session-throttle
+# problem this exists to dodge. Free (no proxy rotation) — just a new
+# Playwright browser/context, same egress IP.
+MAX_SETUP_ATTEMPTS = 2
+
 # Temporary diagnostic flag: skip the DOM-scroll fallback entirely so a run
 # shows exactly how far RPC-paging alone can get (and why it stops) without
 # scrolling masking the true stop point. Set back to False once that's known
@@ -128,40 +137,78 @@ async def main() -> None:
         pushed_count = 0
 
         async with async_playwright() as playwright:
-            browser, context = await launch_context(playwright, headless=True)
-            page = await context.new_page()
-            collector = create_review_collector(page, on_request_captured=on_request_captured)
+            browser = context = page = collector = None
+            location_info: dict | None = None
+            newest_sort_request: dict | None = None
+            pre_sort_ids: set[str] = set()
 
             try:
-                Actor.log.info(f"Opening location for place_id={place_id}...")
-                await open_location(page, place_id)
-                location_info = await extract_location_info(page, place_id)
-                Actor.log.info(
-                    f"Location: {location_info['name']} — "
-                    f"{location_info.get('total_reviews', '?')} reviews reported by Google"
-                )
-                await Actor.set_value("LOCATION_INFO", location_info)
+                # Session/context rotation (2026-08-20) — confirmed live via
+                # a local repeated-click repro that the FIRST sort attempt on
+                # a brand-new browser context reliably resolves fast, while
+                # retrying inside the SAME session (same cookies) after a
+                # failure almost never does (Google appears to throttle the
+                # Newest-sort RPC per-session once it's been used/failed
+                # once). A same-page retry loop inside sort_by_newest can't
+                # fix that; a genuinely fresh browser context can, since
+                # that's the one condition that's actually worked reliably.
+                # Scoped to just the setup phase (open_location through
+                # sort_by_newest) — once that succeeds, the rest of the run
+                # (RPC paging / scroll collection) has never been the
+                # failure point, so it isn't worth restarting for.
+                for setup_attempt in range(1, MAX_SETUP_ATTEMPTS + 1):
+                    captured_request_holder["value"] = None
+                    browser, context = await launch_context(playwright, headless=True)
+                    page = await context.new_page()
+                    collector = create_review_collector(page, on_request_captured=on_request_captured)
+                    try:
+                        Actor.log.info(f"Opening location for place_id={place_id}...")
+                        await open_location(page, place_id)
+                        location_info = await extract_location_info(page, place_id)
+                        Actor.log.info(
+                            f"Location: {location_info['name']} — "
+                            f"{location_info.get('total_reviews', '?')} reviews reported by Google"
+                        )
+                        await Actor.set_value("LOCATION_INFO", location_info)
 
-                await open_reviews_tab(page, place_id)
-                pre_sort_ids: set[str] = set(collector["reviews"].keys())
-                newest_sort_request: dict | None = None
-                if sort_by == "newest":
-                    # A prior "re-navigate fresh right before sorting"
-                    # experiment (bgkey/session snapshot theory, chasing a
-                    # single missing newest review) was reverted here — it
-                    # was explicitly unverified, and confirmed live
-                    # (2026-08-19, Bokashi Berawa run) to cause a hard
-                    # failure: sort_by_newest's qv9Egd response never arrived
-                    # within 12s on any of 5 retries after the extra
-                    # navigation cycle, failing the whole run outright —
-                    # worse than the missing-review issue it was trying to
-                    # fix. Back to a single navigation (open_reviews_tab
-                    # above, already run once) — a proven-stable pattern.
-                    newest_sort_request = await sort_by_newest(page)
-                    if newest_sort_request:
-                        await Actor.set_value("CAPTURED_REQUEST_NEWEST_SORT", newest_sort_request)
-                else:
-                    Actor.log.info('sortBy="relevant" — skipping the sort step, using Google\'s default order.')
+                        await open_reviews_tab(page, place_id)
+                        pre_sort_ids = set(collector["reviews"].keys())
+                        if sort_by == "newest":
+                            # A prior "re-navigate fresh right before
+                            # sorting" experiment (bgkey/session snapshot
+                            # theory, chasing a single missing newest
+                            # review) was reverted here — it was explicitly
+                            # unverified, and confirmed live (2026-08-19,
+                            # Bokashi Berawa run) to cause a hard failure:
+                            # sort_by_newest's qv9Egd response never arrived
+                            # within 12s on any of 5 retries after the extra
+                            # navigation cycle, failing the whole run
+                            # outright — worse than the missing-review issue
+                            # it was trying to fix. That was a mid-session
+                            # re-navigation though, not a fresh browser
+                            # context — consistent with the throttle being
+                            # session/cookie-scoped, not page-scoped (a new
+                            # page in the same context doesn't reset it).
+                            newest_sort_request = await sort_by_newest(page)
+                            if newest_sort_request:
+                                await Actor.set_value("CAPTURED_REQUEST_NEWEST_SORT", newest_sort_request)
+                        else:
+                            Actor.log.info(
+                                'sortBy="relevant" — skipping the sort step, using Google\'s default order.'
+                            )
+                        break  # setup succeeded — keep this browser/page for the rest of the run
+                    except Exception as setup_exc:
+                        if setup_attempt == MAX_SETUP_ATTEMPTS:
+                            # Don't close here — let it propagate to the
+                            # outer except below, which screenshots the
+                            # still-open page before closing (useful
+                            # diagnostic; closing first would lose that).
+                            raise
+                        await browser.close()
+                        Actor.log.warning(
+                            f"Setup failed on browser session {setup_attempt}/{MAX_SETUP_ATTEMPTS} "
+                            f"({setup_exc}) — retrying with a brand-new browser context."
+                        )
 
                 # The RPC-pagination template must reflect whichever sort is
                 # actually active. Using the tab-open request (captured
@@ -331,5 +378,10 @@ async def main() -> None:
                     await Actor.set_value("ERROR_SCREENSHOT", screenshot, content_type="image/png")
                 except Exception:
                     pass
-                await browser.close()
+                # browser can still be None here if launch_context() itself
+                # failed before ever assigning it (e.g. on the very first
+                # setup attempt) — guard so that edge case still reaches
+                # Actor.fail() below instead of crashing on None.close().
+                if browser is not None:
+                    await browser.close()
                 await Actor.fail(status_message=str(exc))

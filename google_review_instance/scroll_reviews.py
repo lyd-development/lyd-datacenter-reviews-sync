@@ -12,9 +12,10 @@ import random
 import time
 from typing import Any, Awaitable, Callable
 
+from apify import Actor
 from playwright.async_api import Page
 
-from .maps_api import parse_batch_execute_body
+from .maps_api import UnexpectedResponseFormatError, parse_batch_execute_body
 from .review_link import build_review_link
 
 
@@ -26,6 +27,10 @@ def create_review_collector(page: Page, on_request_captured: Callable[[dict], Aw
     reviews: dict[str, dict[str, Any]] = {}
     state: dict[str, Any] = {"pagination_token": None}
     captured = {"done": False}
+    # Logged once per run, not once per response — an actual format change
+    # affects every response identically, so logging every occurrence would
+    # just spam the run log without adding information.
+    format_error_logged = {"done": False}
 
     def on_request(request: Any) -> None:
         if captured["done"] or on_request_captured is None:
@@ -58,8 +63,17 @@ def create_review_collector(page: Page, on_request_captured: Callable[[dict], Aw
             for review in parsed["reviews"]:
                 reviews[review["review_id"]] = review
             state["pagination_token"] = parsed.get("pagination_token")
+        except UnexpectedResponseFormatError as exc:
+            # Loud and specific — this is the exact class of bug that went
+            # unnoticed silently for a while (see maps_api.py's
+            # KNOWN_FRAME_IDENTIFIERS docstring). Every future occurrence
+            # should show up clearly in the run log instead of just
+            # manifesting as a mysteriously empty/failed run.
+            if not format_error_logged["done"]:
+                format_error_logged["done"] = True
+                Actor.log.error(f"Google's batchexecute response format may have changed: {exc}")
         except Exception:
-            pass  # undocumented internal format — a shape change breaks this silently
+            pass  # genuinely malformed/unexpected data beyond just the frame identifier — not actionable here
 
     if on_request_captured is not None:
         page.on("request", on_request)

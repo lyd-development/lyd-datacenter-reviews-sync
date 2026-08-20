@@ -17,6 +17,36 @@ def _get(seq: Any, index: int, default: Any = None) -> Any:
     return default
 
 
+# Frame identifiers seen in real captures for the ListUgcPosts RPC.
+# "/MapsUgcPostService.ListUgcPosts" was the only value ever matched here
+# until 2026-08-20, when a real capture showed Google now sends the bare
+# rpcid "qv9Egd" instead — that single-value check had been silently
+# returning None (0 reviews, no error) for every click-triggered response
+# for an unknown amount of time before this was noticed. Both are kept so a
+# reversion (or a future multi-RPC batch using the full path again) still
+# matches.
+KNOWN_FRAME_IDENTIFIERS = ("/MapsUgcPostService.ListUgcPosts", "qv9Egd")
+
+
+class UnexpectedResponseFormatError(RuntimeError):
+    """Raised when none of KNOWN_FRAME_IDENTIFIERS match a batchexecute
+    response's frame — i.e. Google likely changed the response format
+    again. Deliberately distinct from a well-formed-but-genuinely-empty
+    response (0 reviews, valid pagination_token): that case returns
+    normally with an empty review list, this one means the parser itself
+    can no longer make sense of the response shape and needs a human to
+    look at it, not a retry."""
+
+    def __init__(self, seen_identifiers: list, expected_identifiers: tuple = KNOWN_FRAME_IDENTIFIERS):
+        self.seen_identifiers = seen_identifiers
+        self.expected_identifiers = expected_identifiers
+        super().__init__(
+            f"batchexecute response didn't contain any known frame identifier — expected one of "
+            f"{expected_identifiers!r}, got frame[1] values: {seen_identifiers!r}. Google's response "
+            "format likely changed again; this needs investigating, not retrying."
+        )
+
+
 def micros_to_datetime(micros: Any) -> datetime | None:
     if not isinstance(micros, (int, float)):
         return None
@@ -33,9 +63,16 @@ def parse_batch_execute_body(body: str) -> dict | None:
         return None
 
     outer = json.loads(lines[1])
-    frame = next((f for f in outer if _get(f, 1) == "/MapsUgcPostService.ListUgcPosts"), None)
+    frame = next((f for f in outer if _get(f, 1) in KNOWN_FRAME_IDENTIFIERS), None)
     if not frame:
-        return None
+        # Distinct from "genuinely empty" — raises instead of returning None
+        # so callers can tell "Google changed the format, go look at this"
+        # apart from "this page just has no reviews right now". Silently
+        # returning None here for an unmatched identifier is exactly what
+        # let this exact bug go unnoticed for an unknown stretch of time
+        # (see KNOWN_FRAME_IDENTIFIERS' docstring).
+        seen = [_get(f, 1) for f in outer if isinstance(f, list)]
+        raise UnexpectedResponseFormatError(seen)
 
     if not isinstance(_get(frame, 2), str):
         # Confirmed on a real run: a request that deviates from what

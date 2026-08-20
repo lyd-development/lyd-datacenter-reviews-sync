@@ -28,7 +28,7 @@ from urllib.parse import parse_qs, urlencode
 
 from playwright.async_api import Page
 
-from .maps_api import parse_batch_execute_body
+from .maps_api import UnexpectedResponseFormatError, parse_batch_execute_body
 
 CID_PAIR_PATTERN = re.compile(r"!1s(0x[0-9a-f]+:0x[0-9a-f]+)", re.IGNORECASE)
 
@@ -106,7 +106,14 @@ async def fetch_next_page(
                 body_preview = (await response.text())[:300]
                 return None, f"HTTP {response.status}: {body_preview}"
             body = await response.body()
-            parsed = parse_batch_execute_body(body.decode("utf-8"))
+            try:
+                parsed = parse_batch_execute_body(body.decode("utf-8"))
+            except UnexpectedResponseFormatError as exc:
+                # Deterministic, not transient — every retry would hit the
+                # exact same format mismatch. Fail fast instead of burning
+                # 3 attempts' worth of backoff (up to ~9s) on something a
+                # retry can never fix.
+                return None, f"Google's response format may have changed: {exc}"
             if not parsed:
                 body_preview = body.decode("utf-8", errors="replace")[:300]
                 return None, f"response body didn't parse as the expected format: {body_preview}"
