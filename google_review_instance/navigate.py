@@ -85,6 +85,25 @@ async def open_location(page: Page, place_id: str, max_attempts: int = 3) -> Non
 async def extract_location_info(page: Page, place_id: str) -> dict:
     name = (await page.locator("h1").first.inner_text()).strip()
 
+    # Google Maps rewrites the URL from the plain "?q=place_id:..." query
+    # form to the canonical "/place/Name/@lat,lng,zoom/data=!3m1...!1s0x..."
+    # form via client-side history.replaceState() shortly after the page
+    # itself renders — h1 becoming visible doesn't guarantee this rewrite
+    # has happened yet. Confirmed live: capturing page.url immediately after
+    # h1 sometimes still had the plain query-string URL, which has neither
+    # the "@lat,lng" nor the "!1s0x...:0x..." CID marker that
+    # extract_google_id_from_url() and review_link.py's build_review_link()
+    # both require — silently producing a null google_id and a null
+    # reviewLink on every review for that run. Best-effort wait for the
+    # rewrite; proceed with whatever URL is current if it doesn't happen in
+    # time rather than blocking indefinitely.
+    try:
+        await page.wait_for_function(
+            "() => /!1s0x[0-9a-f]+:0x[0-9a-f]+/i.test(location.href)", timeout=6000
+        )
+    except Exception:
+        pass
+
     rating_and_count = await page.evaluate(
         """() => {
             const ratingEl = Array.from(document.querySelectorAll('span[aria-label*="star"]')).find((el) =>
