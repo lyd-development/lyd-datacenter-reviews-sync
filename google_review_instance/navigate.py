@@ -65,6 +65,58 @@ def extract_google_id_from_url(url: str) -> str | None:
         return None
 
 
+def extract_lat_lng_from_url(url: str) -> tuple[float | None, float | None]:
+    # Confirmed live (2026-08-23): the canonical "/place/Name/@lat,lng,zoom/
+    # data=..." URL also embeds the same coordinates a second time as
+    # "!8m2!3d{lat}!4d{lng}" inside the data= block — that second copy is
+    # used here since it's present even when the URL is truncated/rewritten
+    # in ways that drop the leading "@lat,lng".
+    match = re.search(r"!8m2!3d(-?\d+\.\d+)!4d(-?\d+\.\d+)", url)
+    if not match:
+        return None, None
+    try:
+        return float(match.group(1)), float(match.group(2))
+    except ValueError:
+        return None, None
+
+
+# Best-effort address parsing — confirmed live (2026-08-23) that Google's
+# address format varies a lot by country:
+#   US: "1037 McKinley Ave, Columbus, OH 43222, United States"
+#   Indonesia: "Jl. Double Six, Seminyak, Kec. Kuta, Kabupaten Badung, Bali 80361"
+# The Indonesian form has no trailing country segment at all and fuses the
+# postal code onto the province name, so there is no single comma-position
+# rule that works for both. This extracts what it reliably can (postal code,
+# via a bare 4-6 digit token) and falls back to positional heuristics for the
+# rest — city/region/country will often be null or approximate for
+# non-US-style addresses. Accepted tradeoff (confirmed with the user) rather
+# than blocking on a fully general international address parser.
+def parse_address_components(address: str) -> dict:
+    postal_match = re.search(r"\b(\d{4,6}(?:-\d{4})?)\b(?!.*\d)", address)
+    postal_code = postal_match.group(1) if postal_match else None
+
+    segments = [s.strip() for s in address.split(",") if s.strip()]
+    if postal_code and segments:
+        # Strip the postal code out of whichever segment holds it (it may be
+        # fused onto a region name, e.g. "Bali 80361").
+        segments = [re.sub(rf"\s*{re.escape(postal_code)}\s*$", "", s).strip() or s for s in segments]
+
+    country = None
+    # Only trust a country segment when it's recognizably a country name
+    # (not a fused "Province ZIP" segment with the ZIP already stripped) —
+    # confirmed live that Indonesian addresses simply omit a country segment
+    # entirely, so guessing one from position would be wrong more often than
+    # right.
+    KNOWN_COUNTRY_NAMES = {"united states", "indonesia", "united kingdom", "australia", "singapore"}
+    if segments and segments[-1].strip().lower() in KNOWN_COUNTRY_NAMES:
+        country = segments.pop()
+
+    region = segments.pop() if segments else None
+    city = segments.pop() if segments else None
+
+    return {"city": city, "region": region, "postal_code": postal_code, "country": country}
+
+
 async def open_location(page: Page, place_id: str, max_attempts: int = 3) -> None:
     for attempt in range(1, max_attempts + 1):
         try:
@@ -117,15 +169,106 @@ async def extract_location_info(page: Page, place_id: str) -> dict:
             const totalReviews = countEl
                 ? parseInt(countEl.textContent.replace(/[^\\d]/g, ""), 10)
                 : null;
-            return { rating, totalReviews: Number.isNaN(totalReviews) ? null : totalReviews };
+
+            // Confirmed live via Playwright (2026-08-23, real Chrome, "La
+            // Plancha" — matches docs/sources/apify reference dataset's
+            // known category "Bar"): the category button's jsaction middle
+            // token ("wfvdle15") isn't the static "category" string alone,
+            // so match on the suffix. This is distinct from the "similar
+            // places nearby" carousel's category labels, which render as
+            // plain <div class="Q5g20"> with no jsaction attribute at all
+            // — confirmed via a full header-HTML dump, exactly one
+            // jsaction*="category" match on the page.
+            const categoryEl = document.querySelector('button[jsaction*="category"]');
+            const category = categoryEl ? categoryEl.textContent.trim() : null;
+
+            // Business info fields, all confirmed live (2026-08-23) via
+            // their aria-label prefix — the same pattern Google uses
+            // consistently for every info-panel row (see "Address: ...",
+            // "Phone: ...", etc. in a real header-HTML dump).
+            const byAriaLabelPrefix = (prefix) =>
+                Array.from(document.querySelectorAll("button[aria-label], a[aria-label]")).find((el) =>
+                    (el.getAttribute("aria-label") || "").toLowerCase().startsWith(prefix)
+                );
+            const stripPrefix = (el, prefix) =>
+                el ? el.getAttribute("aria-label").replace(new RegExp("^" + prefix + "\\\\s*", "i"), "").trim() : null;
+
+            const addressEl = byAriaLabelPrefix("address:");
+            const phoneEl = byAriaLabelPrefix("phone:");
+            const plusCodeEl = byAriaLabelPrefix("plus code:");
+            const websiteEl = Array.from(document.querySelectorAll("a[aria-label]")).find((el) =>
+                (el.getAttribute("aria-label") || "").toLowerCase().startsWith("website:")
+            );
+
+            // Each day-of-week row has its own aria-label, e.g. "Monday,
+            // 6.30 am to 5.00 pm, Copy open hours" / "Saturday, Closed,
+            // Copy open hours" — confirmed live, present for every day even
+            // when closed.
+            const dayNames = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"];
+            const openingHours = dayNames
+                .map((day) => {
+                    const re = new RegExp("^" + day + ",\\\\s*(.+?),\\\\s*Copy open hours$", "i");
+                    const el = Array.from(document.querySelectorAll("[aria-label]")).find((e) =>
+                        re.test((e.getAttribute("aria-label") || "").trim())
+                    );
+                    if (!el) return null;
+                    const match = (el.getAttribute("aria-label") || "").match(re);
+                    const hoursText = match ? match[1].trim() : null;
+                    return { day, hours: hoursText && !/^closed$/i.test(hoursText) ? [hoursText] : [] };
+                })
+                .filter(Boolean);
+
+            // Open/closed status text, e.g. "Closed · Opens 6.30 am Mon".
+            // Confirmed live (2026-08-23): there is no aria-label on this
+            // element at all (an earlier attempt assumed one and always
+            // returned null) — it's a plain <span> whose direct children
+            // are two styled text spans ("Closed"/"Open" + " · Opens/Closes
+            // ..."). No stable class name to key off either (generated,
+            // e.g. "ZDu9vd"), so instead scan all spans for one whose
+            // trimmed textContent matches the status+detail pattern and
+            // take the shortest match — the innermost element containing
+            // exactly this text, not a larger ancestor that also contains
+            // it.
+            const statusMatches = Array.from(document.querySelectorAll("span"))
+                .map((el) => (el.textContent || "").trim())
+                .filter((t) => /(open|closed)\\b.{0,40}(opens|closes|24 hours)/i.test(t) && t.length < 80);
+            statusMatches.sort((a, b) => a.length - b.length);
+            const openStatus = statusMatches[0] || null;
+
+            const accessibilityAttributes = Array.from(
+                document.querySelectorAll('[aria-label][role="img"][data-tooltip]')
+            )
+                .map((el) => el.getAttribute("aria-label"))
+                .filter((label, idx, arr) => label && arr.indexOf(label) === idx);
+
+            return {
+                rating,
+                totalReviews: Number.isNaN(totalReviews) ? null : totalReviews,
+                category: category || null,
+                address: stripPrefix(addressEl, "address:"),
+                phone: stripPrefix(phoneEl, "phone:"),
+                website: websiteEl ? websiteEl.getAttribute("aria-label").replace(/^website:\\s*/i, "").trim() : null,
+                plusCode: stripPrefix(plusCodeEl, "plus code:"),
+                openingHours,
+                openStatus,
+                accessibilityAttributes,
+            };
         }"""
     )
 
     location_link = page.url
     google_id = extract_google_id_from_url(location_link)
+    latitude, longitude = extract_lat_lng_from_url(location_link)
     reviews_link = (
         f"https://search.google.com/local/reviews?placeid={quote(place_id, safe='')}&q=*&authuser=0&hl=en&gl=US"
     )
+
+    address = rating_and_count.get("address")
+    address_components = parse_address_components(address) if address else {
+        "city": None, "region": None, "postal_code": None, "country": None
+    }
+
+    category = rating_and_count.get("category")
 
     return {
         "place_id": place_id,
@@ -135,6 +278,21 @@ async def extract_location_info(page: Page, place_id: str) -> dict:
         "reviews_link": reviews_link,
         "avg_rating": rating_and_count.get("rating"),
         "total_reviews": rating_and_count.get("totalReviews"),
+        "category": category,
+        "categories": [category] if category else None,
+        "address": address,
+        "city": address_components["city"],
+        "region": address_components["region"],
+        "postal_code": address_components["postal_code"],
+        "country": address_components["country"],
+        "latitude": latitude,
+        "longitude": longitude,
+        "plus_code": rating_and_count.get("plusCode"),
+        "phone": rating_and_count.get("phone"),
+        "website": rating_and_count.get("website"),
+        "opening_hours": rating_and_count.get("openingHours") or None,
+        "open_status": rating_and_count.get("openStatus"),
+        "accessibility_attributes": rating_and_count.get("accessibilityAttributes") or None,
     }
 
 
