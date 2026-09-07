@@ -25,6 +25,22 @@
             "enum": ["newest", "relevant"],
             "enumTitles": ["Newest", "Most relevant (default order, skip sorting)"],
             "default": "newest"
+        },
+        "useProxy": {
+            "title": "Use proxy",
+            "type": "boolean",
+            "description": "Off by default — this project has run without a proxy since v1 and proxying has never been required for Google Maps the way it is for TripAdvisor. Turn on to route each setup retry through a rotated proxy session (see proxyConfiguration below) instead of a direct connection.",
+            "default": false
+        },
+        "proxyConfiguration": {
+            "title": "Proxy configuration",
+            "type": "object",
+            "description": "Only used when \"Use proxy\" above is on. Each fresh-browser-context setup retry (see MAX_SETUP_ATTEMPTS in main.py) picks up a new proxy session, so a retry after a failed Newest-sort attempt gets a different egress IP, not just a new browser/cookies.",
+            "editor": "proxy",
+            "default": {
+                "useApifyProxy": true,
+                "apifyProxyGroups": ["RESIDENTIAL"]
+            }
         }
     },
     "required": ["placeId"]

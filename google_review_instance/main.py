@@ -34,6 +34,7 @@ import json as json_module
 import random
 import re
 from datetime import datetime
+from urllib.parse import urlsplit
 
 from apify import Actor
 from playwright.async_api import async_playwright
@@ -53,13 +54,17 @@ from .scroll_reviews import _sort_newest_first, create_review_collector, scroll_
 RPC_PAGE_SIZE = None
 
 # How many fresh-browser-context attempts to give the setup phase (open
-# location -> open Reviews tab -> sort Newest) before giving up. Kept small —
-# 2, not more — since the one proven-working condition is "first attempt on
-# a brand-new session," so a 2nd attempt (fresh context) either fixes it or
-# it won't; further attempts just burn compute on the same session-throttle
-# problem this exists to dodge. Free (no proxy rotation) — just a new
-# Playwright browser/context, same egress IP.
-MAX_SETUP_ATTEMPTS = 2
+# location -> open Reviews tab -> sort Newest) before giving up. Raised
+# 2 -> 3 (2026-09-06) alongside proxy rotation below — a live test run
+# (place_id ChIJ84FTuLhG0i0R1rMrarZInMo) showed the sort-click failure isn't
+# always the session-throttle case this loop was originally built for: a
+# Google "Sign-in to get the best of Google Maps" interstitial can also
+# intercept the Sort button's click, and getting past that reliably needs a
+# real new session (fresh cookies + a different egress IP), not just one
+# more attempt. Each iteration now also requests a new proxy session (see
+# proxy_configuration.new_url() below), so a retry isn't just a new
+# browser/cookies on the same IP anymore.
+MAX_SETUP_ATTEMPTS = 3
 
 # Temporary diagnostic flag: skip the DOM-scroll fallback entirely so a run
 # shows exactly how far RPC-paging alone can get (and why it stops) without
@@ -118,6 +123,31 @@ async def main() -> None:
             await Actor.fail(status_message="Missing required input: placeId")
             return
 
+        # Off by default (see input_schema.json's useProxy) — this project has
+        # run without a proxy since v1 and it's never been required for
+        # Google Maps the way it is for TripAdvisor's DataDome protection.
+        # When on, rotated per setup attempt below (see MAX_SETUP_ATTEMPTS)
+        # so a retry after a failed Newest-sort attempt gets a different
+        # egress IP, not just a new browser/cookies on the same one.
+        proxy_configuration = None
+        if actor_input.get("useProxy", False):
+            proxy_input = actor_input.get("proxyConfiguration") or {
+                "useApifyProxy": True,
+                "apifyProxyGroups": ["RESIDENTIAL"],
+            }
+            try:
+                proxy_configuration = await Actor.create_proxy_configuration(actor_proxy_input=proxy_input)
+            except Exception as proxy_exc:
+                # e.g. the account/plan doesn't have RESIDENTIAL proxy access —
+                # best-effort only, see comment above.
+                Actor.log.warning(f"Could not set up a proxy configuration ({proxy_exc}) — continuing without one.")
+                proxy_configuration = None
+            if proxy_configuration is None:
+                Actor.log.warning(
+                    "useProxy was on but no proxy configuration is available (Apify proxy not enabled on "
+                    "this account/plan) — continuing without a proxy."
+                )
+
         captured_request_holder: dict = {"value": None}
 
         async def on_request_captured(request_info: dict) -> None:
@@ -158,7 +188,29 @@ async def main() -> None:
                 # failure point, so it isn't worth restarting for.
                 for setup_attempt in range(1, MAX_SETUP_ATTEMPTS + 1):
                     captured_request_holder["value"] = None
-                    browser, context = await launch_context(playwright, headless=True)
+
+                    proxy = None
+                    if proxy_configuration is not None:
+                        try:
+                            # session_id ties this attempt to one sticky proxy IP for
+                            # its own duration, but differs per attempt (place_id +
+                            # attempt number) so a retry actually rotates — reusing
+                            # the same session_id across attempts would hand back the
+                            # same IP again, defeating the point of rotating at all.
+                            proxy_url = await proxy_configuration.new_url(session_id=f"{place_id}_{setup_attempt}")
+                            parsed_proxy = urlsplit(proxy_url)
+                            proxy = {"server": f"http://{parsed_proxy.hostname}:{parsed_proxy.port}"}
+                            if parsed_proxy.username:
+                                proxy["username"] = parsed_proxy.username
+                            if parsed_proxy.password:
+                                proxy["password"] = parsed_proxy.password
+                        except Exception as proxy_url_exc:
+                            Actor.log.warning(
+                                f"Could not get a proxy URL for setup attempt {setup_attempt} "
+                                f"({proxy_url_exc}) — proceeding without a proxy for this attempt."
+                            )
+
+                    browser, context = await launch_context(playwright, headless=True, proxy=proxy)
                     page = await context.new_page()
                     collector = create_review_collector(page, on_request_captured=on_request_captured)
                     try:
