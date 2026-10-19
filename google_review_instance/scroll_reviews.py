@@ -16,6 +16,7 @@ from apify import Actor
 from playwright.async_api import Page
 
 from .maps_api import UnexpectedResponseFormatError, parse_batch_execute_body
+from .navigate import dismiss_signin_prompt
 from .review_link import build_review_link
 
 
@@ -135,8 +136,22 @@ async def scroll_and_collect_reviews(
     no_new_count = 0
     reached_cap = False
     last_flush_at = time.monotonic()
+    iteration = 0
+    # Confirmed live (manual repro, 2026-10-14): the "Sign-in to get the best
+    # of Google Maps" interstitial can reappear mid-scroll on a long session,
+    # not just at the three spots this was previously dismissed (consent
+    # dialog, opening the Reviews tab, the sort click) — once up, it sits on
+    # top and silently blocks the scroll-container clicks below. Re-checking
+    # every single iteration would add up to ~800ms per scroll tick (the
+    # locator waits out its timeout when the modal isn't there), so this is
+    # throttled to once every few iterations instead of on every tick.
+    SIGNIN_PROMPT_CHECK_INTERVAL = 5
 
     while no_new_count < max_scroll_attempts_without_new_reviews:
+        if iteration % SIGNIN_PROMPT_CHECK_INTERVAL == 0:
+            await dismiss_signin_prompt(page)
+        iteration += 1
+
         await feed.evaluate("(el) => el.scrollTo(0, Math.max(0, el.scrollHeight - 200))")
         await page.wait_for_timeout(150)
         await feed.evaluate("(el) => el.scrollTo(0, el.scrollHeight)")

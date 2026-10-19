@@ -39,7 +39,7 @@ from urllib.parse import urlsplit
 from apify import Actor
 from playwright.async_api import async_playwright
 
-from .browser import launch_context
+from .browser import attach_proxy_auth, launch_context
 from .navigate import extract_location_info, open_location, open_reviews_tab, sort_by_newest
 from .review_link import build_review_link
 from .rpc_paginate import fetch_next_page
@@ -52,6 +52,28 @@ from .scroll_reviews import _sort_newest_first, create_review_collector, scroll_
 # Kept at None (use the template's own value) — do not re-attempt a
 # different number without new evidence.
 RPC_PAGE_SIZE = None
+
+# Named (cross-run persistent) Key-Value store holding cookies from a
+# manually-logged-in Google session — see browser.py's launch_context()
+# docstring comment for why this is needed (anonymous sessions get a
+# sign-in interstitial that blocks the Sort-by-Newest click specifically).
+# Login itself is never done by this Actor — Google rejects automated
+# Playwright logins outright — so this store has to be populated manually
+# (export a real, human-driven browser's storage_state and upload it under
+# the STORAGE_STATE key) and refreshed whenever the session expires.
+GOOGLE_SESSION_STORE_NAME = "google-review-session"
+GOOGLE_SESSION_STORE_KEY = "STORAGE_STATE"
+
+# Fixed Apify Proxy session id, used ONLY when a stored Google session is
+# present — confirmed live (2026-10-19) that a logged-in session loaded
+# fine (no error) but Google still silently treated the run as logged-out
+# (screenshot showed the "Sign in" button) when the runtime proxy IP
+# differed from whatever IP the login cookies were originally issued from.
+# The login itself must be performed through this exact same sticky proxy
+# session (see the manual-login runbook), so pinning to a fixed id here —
+# instead of rotating per place_id/attempt like the anonymous path below —
+# is what keeps the runtime IP consistent with the login IP.
+GOOGLE_LOGIN_PROXY_SESSION_ID = "google_login_session_v2"
 
 # How many fresh-browser-context attempts to give the setup phase (open
 # location -> open Reviews tab -> sort Newest) before giving up. Raised
@@ -66,11 +88,14 @@ RPC_PAGE_SIZE = None
 # browser/cookies on the same IP anymore.
 MAX_SETUP_ATTEMPTS = 3
 
-# Temporary diagnostic flag: skip the DOM-scroll fallback entirely so a run
-# shows exactly how far RPC-paging alone can get (and why it stops) without
-# scrolling masking the true stop point. Set back to False once that's known
-# — a real backfill run should still fall back to scrolling on failure.
-DISABLE_SCROLL_FALLBACK = True
+# Was a temporary diagnostic True (skip the DOM-scroll fallback so a run
+# shows exactly how far RPC-paging alone can get). Now known: RPC-paging
+# reliably stops after page 0 with an HTTP 400 (XSRF token mismatch on the
+# second call) — a separate, smaller issue from the Sort-click sign-in
+# modal this session was mainly chasing. Reverted to False per this flag's
+# own original intent, so a real run falls back to scrolling instead of
+# stopping after only the first ~10 reviews.
+DISABLE_SCROLL_FALLBACK = False
 
 # A deliberately fast pacing — confirmed working on one real run (442
 # reviews, no errors, no missing-review symptoms observed) but not yet
@@ -122,6 +147,26 @@ async def main() -> None:
             Actor.log.error("Input must include `placeId` — the Google Maps place_id of the venue to scrape.")
             await Actor.fail(status_message="Missing required input: placeId")
             return
+
+        # Best-effort — an empty/missing store just means this run falls
+        # back to the old anonymous-session behavior (see
+        # GOOGLE_SESSION_STORE_NAME above), not a hard failure.
+        google_storage_state = None
+        try:
+            session_store = await Actor.open_key_value_store(name=GOOGLE_SESSION_STORE_NAME)
+            google_storage_state = await session_store.get_value(GOOGLE_SESSION_STORE_KEY)
+            if google_storage_state:
+                Actor.log.info("Loaded a logged-in Google session from the key-value store.")
+            else:
+                Actor.log.warning(
+                    f"No '{GOOGLE_SESSION_STORE_KEY}' value in the '{GOOGLE_SESSION_STORE_NAME}' "
+                    "key-value store — continuing with an anonymous (logged-out) session."
+                )
+        except Exception as session_exc:
+            Actor.log.warning(
+                f"Could not load the logged-in Google session ({session_exc}) — "
+                "continuing with an anonymous (logged-out) session."
+            )
 
         # Off by default (see input_schema.json's useProxy) — this project has
         # run without a proxy since v1 and it's never been required for
@@ -192,12 +237,20 @@ async def main() -> None:
                     proxy = None
                     if proxy_configuration is not None:
                         try:
-                            # session_id ties this attempt to one sticky proxy IP for
-                            # its own duration, but differs per attempt (place_id +
-                            # attempt number) so a retry actually rotates — reusing
-                            # the same session_id across attempts would hand back the
-                            # same IP again, defeating the point of rotating at all.
-                            proxy_url = await proxy_configuration.new_url(session_id=f"{place_id}_{setup_attempt}")
+                            # session_id ties this attempt to one sticky proxy IP.
+                            # With a stored Google session, it MUST stay fixed
+                            # (GOOGLE_LOGIN_PROXY_SESSION_ID) across every attempt so
+                            # the runtime IP matches whatever IP the login cookies
+                            # came from — see that constant's comment. Without a
+                            # stored session there's no IP to match, so it differs
+                            # per attempt (place_id + attempt number) instead, so a
+                            # retry actually rotates to a new IP.
+                            session_id = (
+                                GOOGLE_LOGIN_PROXY_SESSION_ID
+                                if google_storage_state
+                                else f"{place_id}_{setup_attempt}"
+                            )
+                            proxy_url = await proxy_configuration.new_url(session_id=session_id)
                             parsed_proxy = urlsplit(proxy_url)
                             proxy = {"server": f"http://{parsed_proxy.hostname}:{parsed_proxy.port}"}
                             if parsed_proxy.username:
@@ -210,8 +263,22 @@ async def main() -> None:
                                 f"({proxy_url_exc}) — proceeding without a proxy for this attempt."
                             )
 
-                    browser, context = await launch_context(playwright, headless=True, proxy=proxy)
+                    # headless=False (2026-10-14) — confirmed live that a
+                    # logged-in session ALONE isn't enough: a run with
+                    # google_storage_state loaded still hit the exact same
+                    # Sort-click sign-in modal under headless=True. A local
+                    # repro isolating headed vs. headless (both logged-in)
+                    # showed headless is what triggers it, independent of
+                    # login — so both are needed together. The container
+                    # already wraps this process in `xvfb-run` (see the
+                    # Dockerfile/run command), which exists specifically to
+                    # give a non-headless browser a virtual display to render
+                    # into, so this isn't introducing new infra.
+                    browser, context = await launch_context(
+                        playwright, headless=False, proxy=proxy, storage_state=google_storage_state
+                    )
                     page = await context.new_page()
+                    await attach_proxy_auth(context, page, proxy)
                     collector = create_review_collector(page, on_request_captured=on_request_captured)
                     try:
                         Actor.log.info(f"Opening location for place_id={place_id}...")
