@@ -42,7 +42,7 @@ from playwright.async_api import async_playwright
 from .browser import attach_proxy_auth, launch_context
 from .navigate import extract_location_info, open_location, open_reviews_tab, sort_by_newest
 from .review_link import build_review_link
-from .rpc_paginate import fetch_next_page
+from .rpc_paginate import fetch_next_page, get_xsrf_token
 from .scroll_reviews import _sort_newest_first, create_review_collector, scroll_and_collect_reviews
 
 # Tried page_size=100, then 50, on real runs: both rejected immediately
@@ -360,7 +360,23 @@ async def main() -> None:
                 # the BOTTOM of the file instead of the top, even though the
                 # data itself was no longer missing.
                 already_flushed_ids: set[str] = set()
-                initial_batch = list(collector["reviews"].values())
+                # Confirmed live (2026-10-19): on a sortBy="newest" run, this
+                # collector also holds the batch captured when the Reviews
+                # tab first opened — Google's default "Most relevant" order,
+                # BEFORE the sort click ever ran. That's a different ranking
+                # (relevance/helpfulness, not chronological) and was being
+                # pushed to the dataset right alongside genuinely
+                # newest-sorted reviews — not what a "give me the newest
+                # reviews" run should save. pre_sort_ids (captured right
+                # before the sort click, see above) marks exactly those
+                # pre-sort/"Most relevant" ids; excluded here so only the
+                # sort click's own confirmed-newest response (plus anything
+                # the RPC/scroll loop collects afterward) gets saved.
+                initial_batch = [
+                    r
+                    for rid, r in collector["reviews"].items()
+                    if not (sort_by == "newest" and rid in pre_sort_ids)
+                ]
                 if initial_batch:
                     # review_link is otherwise only built inside the RPC loop
                     # below (per fetched page) — this batch arrived via the
@@ -386,6 +402,14 @@ async def main() -> None:
                     reqid_match = re.search(r"_reqid=(\d+)", pagination_request["url"])
                     reqid = int(reqid_match.group(1)) if reqid_match else 100000
                     token = collector["state"]["pagination_token"]
+                    # Confirmed live (2026-10-19): once the browser carries a
+                    # logged-in Google session, every RPC-paging call fails
+                    # with an HTTP 400 "xsrf" error unless this page-embedded
+                    # anti-CSRF token rides along as an "at" POST field — see
+                    # rpc_paginate.py's get_xsrf_token/SNLM0E_PATTERN comment.
+                    # None on an anonymous session (no token to find), which
+                    # fetch_next_page/build_post_data already tolerate.
+                    xsrf_token = await get_xsrf_token(page)
                     # Diagnostic (2026-08-18): a run against a hotel-category
                     # venue got token=None/empty immediately, skipping RPC-
                     # paging entirely with "reason: None" (stop_reason's
@@ -403,7 +427,23 @@ async def main() -> None:
                         if max_reviews and new_count >= max_reviews:
                             stop_reason = "reached maxReviews"
                             break
-                        reqid += 1
+                        # Confirmed live (2026-10-19), comparing real
+                        # scroll-triggered requests captured back-to-back in
+                        # the same session: _reqid does NOT increment by 1
+                        # between pagination calls — it jumped by exactly
+                        # 100,000 on every one of 3 consecutive real calls
+                        # (21916 -> [sort] 521916 -> 621916 -> 721916, each
+                        # step after the sort +100000). Matching that pattern
+                        # here alone did NOT fix the "well-formed but empty
+                        # response" symptom in further local testing (neither
+                        # did fixing the xsrf/correlation-id/source-path/
+                        # timing hypotheses tried alongside it) — there's
+                        # still some other difference between a real
+                        # scroll-triggered call and this synthetic one that
+                        # wasn't found. Kept anyway since it's evidence-based
+                        # and strictly more correct than the old +1 guess,
+                        # even though it's not sufficient by itself.
+                        reqid += 100_000
                         # Confirmed on a real run: ~1576 back-to-back calls
                         # with essentially zero delay between them (as low as
                         # ~180ms) eventually got rejected — a small random
@@ -412,7 +452,7 @@ async def main() -> None:
                         # resorting to giving up on RPC-paging entirely.
                         await asyncio.sleep(random.uniform(0.3, 0.8))
                         parsed, error = await fetch_next_page(
-                            page, pagination_request, token, reqid, page_size=RPC_PAGE_SIZE
+                            page, pagination_request, token, reqid, page_size=RPC_PAGE_SIZE, xsrf_token=xsrf_token
                         )
                         if not parsed or not parsed["reviews"]:
                             stop_reason = error or "page came back with zero reviews (likely genuinely reached the end)"

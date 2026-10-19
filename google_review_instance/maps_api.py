@@ -88,7 +88,13 @@ def parse_batch_execute_body(body: str) -> dict | None:
 
     inner = json.loads(frame[2])
     pagination_token = _get(inner, 1)
-    raw_reviews = _get(inner, 2, [])
+    # `or []` — confirmed live (2026-10-19) that Google can send an explicit
+    # JSON null at this position (a genuinely-empty page, not a missing
+    # field), which _get()'s `index out of range` default never catches
+    # since index 2 IS present, just null. Without this, `for wrapped in
+    # raw_reviews` below crashes with "'NoneType' object is not iterable"
+    # on what's actually a normal empty-page response, not a format change.
+    raw_reviews = _get(inner, 2, []) or []
 
     reviews = [parse_review_record(_get(wrapped, 0)) for wrapped in raw_reviews]
     return {"pagination_token": pagination_token, "reviews": [r for r in reviews if r]}
